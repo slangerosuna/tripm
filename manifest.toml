@@ -1,0 +1,9 @@
+[package]
+name = "packages.tricti.dev"
+version = "0.0.0"
+license = "GPL-3.0-or-later"
+description = "This is the backend of the TriCTI Package Manager"
+
+[dependencies]
+tricti-compiler = "0.1.0"
+tricti-http = "0.0.0"
