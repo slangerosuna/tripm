@@ -6,4 +6,4 @@ description = "This is the frontend of the TriCTI Package Manager"
 
 [dependencies]
 tricti-compiler = "0.1.0"
-tricti-http = "0.0.0"
+trihttp = "0.0.0"
