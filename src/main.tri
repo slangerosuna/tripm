@@ -44,22 +44,53 @@ PipelineError :: enum
 	CliParse :: struct
 		message: String,
 
-PipelineState :: struct
-	next_id: u64,
-	cli_events: [CliEvent],
-	build_requests: [BuildRequestRecord],
-	build_plans: [BuildPlanRecord],
-	build_results: [BuildResultRecord],
-	errors: [PipelineError],
+PipelineErrorEvent :: struct
+	request_id: ?u64,
+	error: PipelineError,
 
-impl PipelineState:
-	new :: () -> PipelineState => PipelineState {
+PipelineErrorRecord :: struct
+	id: u64,
+	request_id: ?u64,
+	error: PipelineError,
+
+CliEventsTable :: table
+	@primary id: u64,
+	args: [String],
+
+BuildRequestsTable :: table
+	@primary id: u64,
+	manifest_path: String,
+	targets: [String],
+	release: bool,
+	show_help: bool,
+
+BuildPlansTable :: table
+	@primary id: u64,
+	request_id: u64,
+	manifest: PackageManifest,
+
+BuildResultsTable :: table
+	@primary id: u64,
+	request_id: u64,
+	package_name: String,
+	mode: String,
+	success: bool,
+	message: String,
+	artifacts: [String],
+
+PipelineErrorsTable :: table
+	@primary id: u64,
+	request_id: ?u64,
+	error: PipelineError,
+
+TripmRuntime :: @resource struct
+	next_id: u64,
+	manifest_root: String,
+
+impl TripmRuntime:
+	new :: (manifest_root: String) -> TripmRuntime => TripmRuntime {
 		next_id: 1,
-		cli_events: new [CliEvent],
-		build_requests: new [BuildRequestRecord],
-		build_plans: new [BuildPlanRecord],
-		build_results: new [BuildResultRecord],
-		errors: new [PipelineError],
+		manifest_root: manifest_root,
 	}
 
 	allocate_id :: (&mut self) -> u64 => do
@@ -67,196 +98,196 @@ impl PipelineState:
 		self.next_id += 1
 		ret id
 
-	record_cli :: (&mut self, args: [String]) -> u64 => do
-		event_id := self.allocate_id()
-		event := CliEvent { id: event_id, args: clone_string_list(args) }
-		self.cli_events.push(event)
-		ret event_id
+	manifest_loader :: (&self) -> ManifestLoader =>
+		ManifestLoader::new(String::clone(&self.manifest_root))
 
-	record_build_request :: (&mut self, request: BuildRequestRecord) =>
-		self.build_requests.push(request)
+TripmDatabase :: db
+	CliEvents: CliEventsTable,
+	BuildRequests: BuildRequestsTable,
+	BuildPlans: BuildPlansTable,
+	BuildResults: BuildResultsTable,
+	PipelineErrors: PipelineErrorsTable,
+	Runtime: TripmRuntime,
+	State: TripmDbState,
 
-	record_plan :: (&mut self, plan: BuildPlanRecord) =>
-		self.build_plans.push(plan)
 
-	record_result :: (&mut self, result: BuildResultRecord) =>
-		self.build_results.push(result)
+TripmDbState :: @resource struct
+	cli_events: [CliEvent],
+	build_requests: [BuildRequestRecord],
+	build_plans: [BuildPlanRecord],
+	build_results: [BuildResultRecord],
+	pipeline_errors: [PipelineErrorRecord],
 
-	record_error :: (&mut self, err_: PipelineError) =>
-		self.errors.push(err_)
-
-PipelineSignals :: struct
+impl TripmDbState:
+	new :: () -> TripmDbState => TripmDbState {
+		cli_events: new [CliEvent],
+		build_requests: new [BuildRequestRecord],
+		build_plans: new [BuildPlanRecord],
+		build_results: new [BuildResultRecord],
+		pipeline_errors: new [PipelineErrorRecord],
+	}
+TripmBus :: @resource struct
 	build_requests: Signal<BuildRequestRecord>,
 	build_sender: SenderId,
 	build_receiver: ReceiverId,
-	manifest_ready: Signal<BuildPlanRecord>,
-	manifest_sender: SenderId,
-	manifest_receiver: ReceiverId,
-	build_results: Signal<BuildResultRecord>,
-	result_sender: SenderId,
-	result_receiver: ReceiverId,
-	pipeline_errors: Signal<PipelineError>,
-	error_sender: SenderId,
-	error_receiver: ReceiverId,
 
-impl PipelineSignals:
-	new :: () -> !PipelineSignals => do
+impl TripmBus:
+	new :: () -> !TripmBus => do
 		build_requests := Signal<BuildRequestRecord>::new(
-			String::from_cstr("pipeline.build_requests" as *u8),
+			String::from_cstr("tripm.build_requests" as *u8),
 			SignalTopology::MPSC,
 			BufferingStrategy::FIFO { capacity: 32 },
 		)
 		build_sender := match build_requests.register_sender():
 			ok sender_id => sender_id
-			err err_ => ret err err_
+			err err_ => do
+				message := std_error_message(err_)
+				println(String::from_cstr("[tripm] failed to initialize build request signal" as *u8))
+				println(String::from_cstr("  message: " as *u8) + message)
+				ret err err_
 		build_receiver := match build_requests.register_receiver():
 			ok receiver_id => receiver_id
 			err err_ => ret err err_
 
-		manifest_ready := Signal<BuildPlanRecord>::new(
-			String::from_cstr("pipeline.manifest_ready" as *u8),
-			SignalTopology::SPMC,
-			BufferingStrategy::FIFO { capacity: 16 },
-		)
-		manifest_sender := match manifest_ready.register_sender():
-			ok sender_id => sender_id
-			err err_ => ret err err_
-		manifest_receiver := match manifest_ready.register_receiver():
-			ok receiver_id => receiver_id
-			err err_ => ret err err_
-
-		build_results := Signal<BuildResultRecord>::new(
-			String::from_cstr("pipeline.build_results" as *u8),
-			SignalTopology::MPSC,
-			BufferingStrategy::FIFO { capacity: 16 },
-		)
-		result_sender := match build_results.register_sender():
-			ok sender_id => sender_id
-			err err_ => ret err err_
-		result_receiver := match build_results.register_receiver():
-			ok receiver_id => receiver_id
-			err err_ => ret err err_
-
-		pipeline_errors := Signal<PipelineError>::new(
-			String::from_cstr("pipeline.errors" as *u8),
-			SignalTopology::MPSC,
-			BufferingStrategy::FIFO { capacity: 16 },
-		)
-		error_sender := match pipeline_errors.register_sender():
-			ok sender_id => sender_id
-			err err_ => ret err err_
-		error_receiver := match pipeline_errors.register_receiver():
-			ok receiver_id => receiver_id
-			err err_ => ret err err_
-
-		ret ok PipelineSignals {
+		ret ok TripmBus {
 			build_requests: build_requests,
 			build_sender: build_sender,
 			build_receiver: build_receiver,
-			manifest_ready: manifest_ready,
-			manifest_sender: manifest_sender,
-			manifest_receiver: manifest_receiver,
-			build_results: build_results,
-			result_sender: result_sender,
-			result_receiver: result_receiver,
-			pipeline_errors: pipeline_errors,
-			error_sender: error_sender,
-			error_receiver: error_receiver,
 		}
 
 	emit_build_request :: (&mut self, request: BuildRequestRecord) -> !none =>
 		self.build_requests.send(self.build_sender, request)
 
-	emit_manifest_ready :: (&mut self, plan: BuildPlanRecord) -> !none =>
-		self.manifest_ready.send(self.manifest_sender, plan)
-
-	emit_build_result :: (&mut self, result: BuildResultRecord) -> !none =>
-		self.build_results.send(self.result_sender, result)
-
-	emit_error :: (&mut self, err_: PipelineError) -> !none =>
-		self.pipeline_errors.send(self.error_sender, err_)
-
-	take_next_build_request :: (&mut self) -> ?BuildRequestRecord =>
+	next_build_request :: (&mut self) -> ?BuildRequestRecord =>
 		self.build_requests.try_receive(self.build_receiver)
 
-	take_next_manifest :: (&mut self) -> ?BuildPlanRecord =>
-		self.manifest_ready.try_receive(self.manifest_receiver)
+record_cli_event :: sys (
+	runtime: res &mut TripmRuntime,
+	db: res &mut TripmDbState,
+	@sys_input args: [String],
+) -> !u64 => do
+	id := runtime.allocate_id()
+	stored_args := clone_string_list(args)
+	db.cli_events.push(CliEvent { id: id, args: stored_args })
+	ret ok id
 
-	take_next_build_result :: (&mut self) -> ?BuildResultRecord =>
-		self.build_results.try_receive(self.result_receiver)
+record_build_request :: sys (
+	runtime: res &mut TripmRuntime,
+	db: res &mut TripmDbState,
+	bus: res &mut TripmBus,
+	@sys_input manifest_path: String,
+	@sys_input targets: [String],
+	@sys_input release: bool,
+	@sys_input show_help: bool,
+) -> !BuildRequestRecord => do
+	request_id := runtime.allocate_id()
+	stored_targets := clone_string_list(targets)
+	request := BuildRequestRecord {
+		id: request_id,
+		manifest_path: manifest_path,
+		targets: stored_targets,
+		release: release,
+		show_help: show_help,
+	}
+	db.build_requests.push(clone_build_request(&request))
+	match bus.emit_build_request(clone_build_request(&request)):
+		ok none => none
+		err err_ => ret err err_
+	ret ok request
 
-	take_next_error :: (&mut self) -> ?PipelineError =>
-		self.pipeline_errors.try_receive(self.error_receiver)
+TripmPipelineTick :: Signal<Mpsc, Buffer, none>
 
-drain_build_requests :: (
-	state: &mut PipelineState,
-	signals: &mut PipelineSignals,
-	loader: &ManifestLoader,
+poll_build_request :: sys (
+	bus: res &mut TripmBus,
+) -> !?BuildRequestRecord => do
+	ret ok bus.next_build_request()
+
+load_manifest_for_request :: sys (
+	runtime: res &mut TripmRuntime,
+	db: res &mut TripmDbState,
+	@sys_input request: BuildRequestRecord,
+) -> !?BuildPlanRecord => do
+	loader := runtime.manifest_loader()
+	manifest_result := loader.load(String::clone(&request.manifest_path))
+	match manifest_result:
+		ok manifest => do
+			plan := BuildPlanRecord {
+				request_id: request.id,
+				request: clone_build_request(&request),
+				manifest: manifest,
+			}
+			ret ok some plan
+		err err_ => do
+			message := std_error_message(err_)
+			event := PipelineErrorEvent {
+				request_id: some request.id,
+				error: PipelineError::ManifestLoad {
+					path: String::clone(&request.manifest_path),
+					message: message,
+				},
+			}
+			record := PipelineErrorRecord {
+				id: runtime.allocate_id(),
+				request_id: event.request_id,
+				error: clone_pipeline_error(&event.error),
+			}
+			db.pipeline_errors.push(record)
+			print_pipeline_error_event(event)
+			ret ok none
+
+prepare_manifest_outputs :: sys (
+	db: res &mut TripmDbState,
+	@sys_input plan: BuildPlanRecord,
+) -> !BuildPlanRecord => do
+	db.build_plans.push(clone_build_plan(&plan))
+	print_plan_summary(clone_build_plan(&plan))
+	ret ok plan
+
+execute_build_plan_stage :: sys (
+	@sys_input plan: BuildPlanRecord,
+) -> !BuildResultRecord => do
+	result := execute_build_plan(&plan)
+	ret ok result
+
+finalize_build_result :: sys (
+	db: res &mut TripmDbState,
+	@sys_input result: BuildResultRecord,
+) -> !none => do
+	db.build_results.push(clone_build_result(&result))
+	print_build_result(result)
+	ret ok none
+
+drive_tripm_pipeline_once :: sys (
+	runtime: res &mut TripmRuntime,
+	db: res &mut TripmDbState,
+	bus: res &mut TripmBus,
+) -> !bool => do
+	match poll_build_request(bus)?:
+		some request => do
+			match load_manifest_for_request(runtime, db, request)?:
+				some plan => do
+					prepared_plan := prepare_manifest_outputs(db, plan)?
+					result := execute_build_plan_stage(prepared_plan)?
+					finalize_build_result(db, result)?
+					ret ok true
+				none => ret ok true
+		none => ret ok false
+
+drive_tripm_pipeline :: sys (
+	runtime: res &mut TripmRuntime,
+	db: res &mut TripmDbState,
+	bus: res &mut TripmBus,
 ) -> !none => do
 	while true:
-		maybe_request := signals.take_next_build_request()
-		match maybe_request:
-			some request => do
-				path := String::clone(&request.manifest_path)
-				manifest := match loader.load(path):
-					ok manifest_value => manifest_value
-					err err_ => do
-						message := std_error_message(err_)
-						error_payload := PipelineError::ManifestLoad {
-							path: String::clone(&request.manifest_path),
-							message: message,
-						}
-								emit_result := signals.emit_error(error_payload)
-								match emit_result:
-									ok none => none
-									err send_err => ret err send_err
-						cont
-
-				plan := BuildPlanRecord {
-					request_id: request.id,
-					request: request,
-					manifest: manifest,
-				}
-				match signals.emit_manifest_ready(plan):
-					ok none => none
-					err send_err => ret err send_err
-			none => break
+		processed := drive_tripm_pipeline_once(runtime, db, bus)?
+		if not processed:
+			break
 	ret ok none
 
-drain_manifest_ready :: (state: &mut PipelineState, signals: &mut PipelineSignals) -> !none => do
-	while true:
-		maybe_plan := signals.take_next_manifest()
-		match maybe_plan:
-			some plan => do
-				stored := clone_build_plan(&plan)
-				state.record_plan(stored)
-				print_plan_summary(plan)
-				result := execute_build_plan(&plan)
-				match signals.emit_build_result(result):
-					ok none => none
-					err send_err => ret err send_err
-			none => break
-	ret ok none
+@trigger TripmPipelineTick, TripmDatabase
+tripm_pipeline :: compose
+	poll_build_request ?-> load_manifest_for_request -> prepare_manifest_outputs -> execute_build_plan_stage -> finalize_build_result
 
-drain_build_results :: (state: &mut PipelineState, signals: &mut PipelineSignals) -> !none => do
-	while true:
-		maybe_result := signals.take_next_build_result()
-		match maybe_result:
-			some result => do
-				state.record_result(clone_build_result(&result))
-				print_build_result(result)
-			none => break
-	ret ok none
-
-drain_pipeline_errors :: (state: &mut PipelineState, signals: &mut PipelineSignals) -> !none => do
-	while true:
-		maybe_error := signals.take_next_error()
-		match maybe_error:
-			some err_ => do
-				state.record_error(clone_pipeline_error(&err_))
-				print_pipeline_error(err_)
-			none => break
-	ret ok none
 
 clone_string_list :: (source: [String]) -> [String] => do
 	clone := new [String]
@@ -404,6 +435,13 @@ print_pipeline_error :: (err_: PipelineError) => match err_:
 	PipelineError::CliParse :: struct { message } => do
 		println(String::from_cstr("[tripm] cli parse error" as *u8))
 		println(String::from_cstr("  message: " as *u8) + message)
+
+print_pipeline_error_event :: (event: PipelineErrorEvent) => do
+	println(String::from_cstr("[tripm] pipeline error" as *u8))
+	match event.request_id:
+		some id => println(String::from_cstr("  request-id: " as *u8) + String::from_u64(id))
+		none => println(String::from_cstr("  request-id: (none)" as *u8))
+	print_pipeline_error(event.error)
 
 print_build_result :: (result: BuildResultRecord) => do
 	println(String::from_cstr("[tripm] build result" as *u8))
@@ -695,20 +733,21 @@ render_build_help :: () => do
 	println(String::from_cstr("  --debug      Force debug build" as *u8))
 	println(String::from_cstr("  targets      Optional build targets" as *u8))
 
-render_pipeline_snapshot :: (state: &PipelineState) => do
+render_pipeline_snapshot :: (db: &TripmDbState) => do
 	println(String::from_cstr("[tripm] pipeline snapshot" as *u8))
-	println(String::from_cstr("  cli-events: " as *u8) + String::from_u64(state.cli_events.len))
-	println(String::from_cstr("  build-requests: " as *u8) + String::from_u64(state.build_requests.len))
-	println(String::from_cstr("  build-plans: " as *u8) + String::from_u64(state.build_plans.len))
-	println(String::from_cstr("  build-results: " as *u8) + String::from_u64(state.build_results.len))
-	println(String::from_cstr("  errors: " as *u8) + String::from_u64(state.errors.len))
+	println(String::from_cstr("  cli-events: " as *u8) + String::from_u64(db.cli_events.len))
+	println(String::from_cstr("  build-requests: " as *u8) + String::from_u64(db.build_requests.len))
+	println(String::from_cstr("  build-plans: " as *u8) + String::from_u64(db.build_plans.len))
+	println(String::from_cstr("  build-results: " as *u8) + String::from_u64(db.build_results.len))
+	println(String::from_cstr("  errors: " as *u8) + String::from_u64(db.pipeline_errors.len))
 
-run_build_command :: (
-	state: &mut PipelineState,
-	signals: &mut PipelineSignals,
-	targets: [String],
-	release: bool,
-	show_help: bool,
+run_build_command :: sys (
+	runtime: res &mut TripmRuntime,
+	db_: res &mut TripmDbState,
+	bus: res &mut TripmBus,
+	@sys_input targets: [String],
+	@sys_input release: bool,
+	@sys_input show_help: bool,
 ) -> !none => do
 	if show_help:
 		render_build_help()
@@ -716,54 +755,25 @@ run_build_command :: (
 
 	request_targets := clone_string_list(targets)
 	manifest_path := determine_manifest_path(&request_targets)
-	request_id := state.allocate_id()
+	match record_build_request(runtime, db_, bus, manifest_path, request_targets, release, show_help):
+		ok request => do
+			manifest_display := String::clone(&request.manifest_path)
+			mode_label := build_mode_label(request.release)
+			target_label := join_target_list(&request.targets)
+			target_count := request.targets.len
 
-	request := BuildRequestRecord {
-		id: request_id,
-		manifest_path: manifest_path,
-		targets: request_targets,
-		release: release,
-		show_help: show_help,
-	}
-
-	state.record_build_request(clone_build_request(&request))
-
-	manifest_display := String::clone(&request.manifest_path)
-	mode_label := build_mode_label(request.release)
-	target_label := join_target_list(&request.targets)
-	target_count := request.targets.len
-
-	println(String::from_cstr("[tripm] enqueue build request" as *u8))
-	println(String::from_cstr("  manifest: " as *u8) + manifest_display)
-	println(String::from_cstr("  mode: " as *u8) + mode_label)
-	if target_count == 0:
-		println(String::from_cstr("  targets: (using src/main.tri)" as *u8))
-	else:
-		println(String::from_cstr("  targets: " as *u8) + target_label)
-
-	emit_status := signals.emit_build_request(request)
-	match emit_status:
-		ok none => none
-		err err_ => ret err err_
-
-	project_root := current_project_root()
-	loader := ManifestLoader::new(project_root)
-
-	match drain_build_requests(state, signals, &loader):
-		ok none => none
-		err err_ => ret err err_
-
-	match drain_manifest_ready(state, signals):
-		ok none => none
-		err err_ => ret err err_
-
-	match drain_build_results(state, signals):
-		ok none => none
-		err err_ => ret err err_
-
-	match drain_pipeline_errors(state, signals):
-		ok none => none
-		err err_ => ret err err_
+			println(String::from_cstr("[tripm] enqueue build request" as *u8))
+			println(String::from_cstr("  manifest: " as *u8) + manifest_display)
+			println(String::from_cstr("  mode: " as *u8) + mode_label)
+			if target_count == 0:
+				println(String::from_cstr("  targets: (using src/main.tri)" as *u8))
+			else:
+				println(String::from_cstr("  targets: " as *u8) + target_label)
+			err err_ => do
+			message := std_error_message(err_)
+			println(String::from_cstr("[tripm] build enqueue failed" as *u8))
+			println(String::from_cstr("  message: " as *u8) + message)
+			ret err err_
 
 	ret ok none
 
@@ -771,12 +781,9 @@ current_project_root :: () -> String => String::from_cstr("." as *u8)
 
 main :: () => do
 	command_line := CommandLine::current()
-	state := PipelineState::new()
-
-	args := command_line.slice_from(0)
-	cli_record_id := state.record_cli(args)
-
-	signals := match PipelineSignals::new():
+	runtime := TripmRuntime::new(current_project_root())
+	db_ := TripmDbState::new()
+	bus := match TripmBus::new():
 		ok value => value
 		err err_ => do
 			message := std_error_message(err_)
@@ -784,13 +791,29 @@ main :: () => do
 			println(String::from_cstr("  message: " as *u8) + message)
 			ret
 
+	args := command_line.slice_from(0)
+	match record_cli_event(&mut runtime, &mut db_, args):
+		ok _ => none
+		err err_ => do
+			message := std_error_message(err_)
+			println(String::from_cstr("[tripm] failed to record CLI event" as *u8))
+			println(String::from_cstr("  message: " as *u8) + message)
+
 	invocation := match CliInvocation::parse(command_line):
 		ok parsed => parsed
 		err err_ => do
 			message := std_error_message(err_)
-			pipeline_err := PipelineError::CliParse { message: message }
-			state.record_error(clone_pipeline_error(&pipeline_err))
-			print_pipeline_error(pipeline_err)
+			event := PipelineErrorEvent {
+				request_id: none,
+				error: PipelineError::CliParse { message: message },
+			}
+			record := PipelineErrorRecord {
+				id: runtime.allocate_id(),
+				request_id: event.request_id,
+				error: clone_pipeline_error(&event.error),
+			}
+			db_.pipeline_errors.push(record)
+			print_pipeline_error_event(event)
 			ret
 
 	match invocation.command:
@@ -803,10 +826,15 @@ main :: () => do
 		CliCommand::Check => do
 			println(String::from_cstr("[tripm] check is not implemented yet" as *u8))
 		CliCommand::Build :: struct { targets, release, show_help } => do
-			build_execution := run_build_command(&mut state, &mut signals, targets, release, show_help)
-			match build_execution:
-				ok none => none
-				err err_ => ret err err_
+			match run_build_command(&mut runtime, &mut db, &mut bus, targets, release, show_help):
+				ok none => match drive_tripm_pipeline(&mut runtime, &mut db, &mut bus):
+					ok none => none
+					err err_ => do
+						message := std_error_message(err_)
+						println(String::from_cstr("[tripm] pipeline pump failed" as *u8))
+						println(String::from_cstr("  message: " as *u8) + message)
+					err _ => ret
 		other => do
 			println(String::from_cstr("[tripm] unsupported command" as *u8))
-	render_pipeline_snapshot(&state)
+
+	render_pipeline_snapshot(&db_)
