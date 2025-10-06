@@ -1,0 +1,193 @@
+# Package manifest loading for tripm
+
+use prelude
+use core::collections
+use core::errors
+use core::io
+use core::string
+
+PackageManifest :: struct
+    name: String,
+    version: String,
+    license: String,
+    description: String,
+    dependencies: [DependencySpec],
+
+DependencySpec :: struct
+    name: String,
+    requirement: String,
+    source: DependencySource,
+
+DependencySource :: enum
+    Registry,
+    Git :: struct
+        reference: String,
+    Path :: struct
+        relative: String,
+
+ManifestLoader :: struct
+    root_path: String,
+
+impl ManifestLoader:
+    new :: (root_path: String) -> ManifestLoader => ManifestLoader { root_path: root_path }
+
+    load :: (&self, relative_path: String) -> !PackageManifest => do
+        manifest_path := self.join_path(relative_path)
+        file := File::open(manifest_path, FileMode::Read)?
+        contents := file.read_to_string()?
+        self.parse(contents)
+
+    join_path :: (&self, relative: String) -> String => do
+        base := String::clone(&self.root_path)
+        if base.len == 0:
+            ret relative
+
+        if base.data[base.len - 1] ~= 47:
+            String::push_char(&base, 47)
+        String::push_str(&base, &relative)
+        ret base
+
+    parse :: (&self, raw: String) -> !PackageManifest => do
+        lines := split_lines(raw)
+        manifest := PackageManifest::empty()
+        section := ParseSection::Root
+
+        for i in 0..lines.len:
+            line := lines.get(i)?
+            trimmed := String::trim(&line)
+            if trimmed.len == 0:
+                cont
+            first := trimmed.data[0]
+            if first == 35:
+                cont
+
+            if first == 91 and trimmed.data[trimmed.len - 1] == 93:
+                section = ManifestLoader::parse_section(trimmed)
+                cont
+
+            match section:
+                ParseSection::Root => ManifestLoader::parse_root_kv(trimmed, &mut manifest)?
+                ParseSection::Dependencies => ManifestLoader::parse_dependency(trimmed, &mut manifest)?
+        ret ok manifest
+
+    parse_section :: (line: String) -> ParseSection => do
+        inner := String::substring(&line, 1, line.len - 1)
+        if String::equals(&inner, &String::from_cstr("package" as *u8)):
+            ret ParseSection::Root
+        elif String::equals(&inner, &String::from_cstr("dependencies" as *u8)):
+            ret ParseSection::Dependencies
+        else:
+            ret ParseSection::Unknown
+
+    parse_root_kv :: (line: String, manifest: &mut PackageManifest) -> !none => do
+    pair := split_key_value(line)?
+        key := String::trim(&pair.key)
+        value := normalize_value(pair.value)
+
+        if String::equals(&key, &String::from_cstr("name" as *u8)):
+            manifest.name = value
+        elif String::equals(&key, &String::from_cstr("version" as *u8)):
+            manifest.version = value
+        elif String::equals(&key, &String::from_cstr("license" as *u8)):
+            manifest.license = value
+        elif String::equals(&key, &String::from_cstr("description" as *u8)):
+            manifest.description = value
+        else:
+            ret err StdError::Unsupported(key)
+        ret ok none
+
+    parse_dependency :: (line: String, manifest: &mut PackageManifest) -> !none => do
+        pair := split_key_value(line)?
+        name := String::trim(&pair.key)
+        requirement_raw := String::trim(&pair.value)
+        requirement := normalize_value(requirement_raw)
+
+        source := detect_dependency_source(&requirement)
+        spec := DependencySpec {
+            name: name,
+            requirement: requirement,
+            source: source,
+        }
+        manifest.dependencies.push(spec)
+        ret ok none
+
+ParseSection :: enum
+    Root,
+    Dependencies,
+    Unknown,
+
+KeyValue :: struct
+    key: String,
+    value: String,
+
+PackageManifest::empty :: () -> PackageManifest => PackageManifest {
+    name: String::new(),
+    version: String::new(),
+    license: String::new(),
+    description: String::new(),
+    dependencies: new [DependencySpec],
+}
+
+split_lines :: (input: String) -> [String] => do
+    lines := new [String]
+    current := String::new()
+
+    for i in 0..input.len:
+        ch := input.data[i]
+        if ch == 10 or ch == 13:
+            if current.len > 0:
+                lines.push(current)
+                current = String::new()
+        else:
+            String::push_char(&current, ch)
+    if current.len > 0:
+        lines.push(current)
+    ret lines
+
+split_key_value :: (line: String) -> !KeyValue => do
+    maybe_position := find_equals(line)
+    match maybe_position:
+        some position => do
+            idx := position as u64
+            key := String::substring(&line, 0, idx)
+            value := String::substring(&line, idx + 1, line.len)
+            ret ok KeyValue { key: key, value: value }
+        none => do
+            prefix := String::from_cstr("Expected `key = value`, got:" as *u8)
+            detail := String::clone(&line)
+            message := join_with_space(prefix, detail)
+            ret err StdError::InvalidArgument(message)
+
+find_equals :: (line: String) -> ?i64 => do
+    for i in 0..line.len:
+        if line.data[i] == 61:
+            ret some i as i64
+    none
+
+normalize_value :: (input: String) -> String => do
+    trimmed := String::trim(&input)
+    if trimmed.len == 0:
+        ret trimmed
+
+    first := trimmed.data[0]
+    last := trimmed.data[trimmed.len - 1]
+    if (first == 34 and last == 34) or (first == 39 and last == 39):
+        ret String::substring(&trimmed, 1, trimmed.len - 1)
+    ret trimmed
+
+detect_dependency_source :: (spec: &String) -> DependencySource => do
+    if spec.len >= 4 and spec.data[0] == 103 and spec.data[1] == 105 and spec.data[2] == 116 and spec.data[3] == 32:
+        reference := String::substring(spec, 4, spec.len)
+        ret DependencySource::Git { reference: reference }
+    elif spec.len >= 5 and spec.data[0] == 112 and spec.data[1] == 97 and spec.data[2] == 116 and spec.data[3] == 104 and spec.data[4] == 32:
+        relative := String::substring(spec, 5, spec.len)
+        ret DependencySource::Path { relative: relative }
+    else:
+        ret DependencySource::Registry
+
+join_with_space :: (left: String, right: String) -> String => do
+    combined := String::clone(&left)
+    if combined.len > 0 and combined.data[combined.len - 1] ~= 32:
+        String::push_char(&combined, 32)
+    String::push_str(&combined, &right)
+    ret combined
