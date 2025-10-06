@@ -1,0 +1,812 @@
+use prelude
+use core::collections
+use core::errors
+use core::signal
+use core::string
+use io::command
+use io::dir
+use io::path
+use ffi::marshal
+
+use cli
+use manifest
+
+extern system :: (command: *raw u8) -> i32
+
+CliEvent :: struct
+	id: u64,
+	args: [String],
+
+BuildRequestRecord :: struct
+	id: u64,
+	manifest_path: String,
+	targets: [String],
+	release: bool,
+	show_help: bool,
+
+BuildPlanRecord :: struct
+	request_id: u64,
+	request: BuildRequestRecord,
+	manifest: PackageManifest,
+
+BuildResultRecord :: struct
+	request_id: u64,
+	package_name: String,
+	mode: String,
+	success: bool,
+	message: String,
+	artifacts: [String],
+
+PipelineError :: enum
+	ManifestLoad :: struct
+		path: String,
+		message: String,
+	CliParse :: struct
+		message: String,
+
+PipelineState :: struct
+	next_id: u64,
+	cli_events: [CliEvent],
+	build_requests: [BuildRequestRecord],
+	build_plans: [BuildPlanRecord],
+	build_results: [BuildResultRecord],
+	errors: [PipelineError],
+
+impl PipelineState:
+	new :: () -> PipelineState => PipelineState {
+		next_id: 1,
+		cli_events: new [CliEvent],
+		build_requests: new [BuildRequestRecord],
+		build_plans: new [BuildPlanRecord],
+		build_results: new [BuildResultRecord],
+		errors: new [PipelineError],
+	}
+
+	allocate_id :: (&mut self) -> u64 => do
+		id := self.next_id
+		self.next_id += 1
+		ret id
+
+	record_cli :: (&mut self, args: [String]) -> u64 => do
+		event_id := self.allocate_id()
+		event := CliEvent { id: event_id, args: clone_string_list(args) }
+		self.cli_events.push(event)
+		ret event_id
+
+	record_build_request :: (&mut self, request: BuildRequestRecord) =>
+		self.build_requests.push(request)
+
+	record_plan :: (&mut self, plan: BuildPlanRecord) =>
+		self.build_plans.push(plan)
+
+	record_result :: (&mut self, result: BuildResultRecord) =>
+		self.build_results.push(result)
+
+	record_error :: (&mut self, err_: PipelineError) =>
+		self.errors.push(err_)
+
+PipelineSignals :: struct
+	build_requests: Signal<BuildRequestRecord>,
+	build_sender: SenderId,
+	build_receiver: ReceiverId,
+	manifest_ready: Signal<BuildPlanRecord>,
+	manifest_sender: SenderId,
+	manifest_receiver: ReceiverId,
+	build_results: Signal<BuildResultRecord>,
+	result_sender: SenderId,
+	result_receiver: ReceiverId,
+	pipeline_errors: Signal<PipelineError>,
+	error_sender: SenderId,
+	error_receiver: ReceiverId,
+
+impl PipelineSignals:
+	new :: () -> !PipelineSignals => do
+		build_requests := Signal<BuildRequestRecord>::new(
+			String::from_cstr("pipeline.build_requests" as *u8),
+			SignalTopology::MPSC,
+			BufferingStrategy::FIFO { capacity: 32 },
+		)
+		build_sender := match build_requests.register_sender():
+			ok sender_id => sender_id
+			err err_ => ret err err_
+		build_receiver := match build_requests.register_receiver():
+			ok receiver_id => receiver_id
+			err err_ => ret err err_
+
+		manifest_ready := Signal<BuildPlanRecord>::new(
+			String::from_cstr("pipeline.manifest_ready" as *u8),
+			SignalTopology::SPMC,
+			BufferingStrategy::FIFO { capacity: 16 },
+		)
+		manifest_sender := match manifest_ready.register_sender():
+			ok sender_id => sender_id
+			err err_ => ret err err_
+		manifest_receiver := match manifest_ready.register_receiver():
+			ok receiver_id => receiver_id
+			err err_ => ret err err_
+
+		build_results := Signal<BuildResultRecord>::new(
+			String::from_cstr("pipeline.build_results" as *u8),
+			SignalTopology::MPSC,
+			BufferingStrategy::FIFO { capacity: 16 },
+		)
+		result_sender := match build_results.register_sender():
+			ok sender_id => sender_id
+			err err_ => ret err err_
+		result_receiver := match build_results.register_receiver():
+			ok receiver_id => receiver_id
+			err err_ => ret err err_
+
+		pipeline_errors := Signal<PipelineError>::new(
+			String::from_cstr("pipeline.errors" as *u8),
+			SignalTopology::MPSC,
+			BufferingStrategy::FIFO { capacity: 16 },
+		)
+		error_sender := match pipeline_errors.register_sender():
+			ok sender_id => sender_id
+			err err_ => ret err err_
+		error_receiver := match pipeline_errors.register_receiver():
+			ok receiver_id => receiver_id
+			err err_ => ret err err_
+
+		ret ok PipelineSignals {
+			build_requests: build_requests,
+			build_sender: build_sender,
+			build_receiver: build_receiver,
+			manifest_ready: manifest_ready,
+			manifest_sender: manifest_sender,
+			manifest_receiver: manifest_receiver,
+			build_results: build_results,
+			result_sender: result_sender,
+			result_receiver: result_receiver,
+			pipeline_errors: pipeline_errors,
+			error_sender: error_sender,
+			error_receiver: error_receiver,
+		}
+
+	emit_build_request :: (&mut self, request: BuildRequestRecord) -> !none =>
+		self.build_requests.send(self.build_sender, request)
+
+	emit_manifest_ready :: (&mut self, plan: BuildPlanRecord) -> !none =>
+		self.manifest_ready.send(self.manifest_sender, plan)
+
+	emit_build_result :: (&mut self, result: BuildResultRecord) -> !none =>
+		self.build_results.send(self.result_sender, result)
+
+	emit_error :: (&mut self, err_: PipelineError) -> !none =>
+		self.pipeline_errors.send(self.error_sender, err_)
+
+	take_next_build_request :: (&mut self) -> ?BuildRequestRecord =>
+		self.build_requests.try_receive(self.build_receiver)
+
+	take_next_manifest :: (&mut self) -> ?BuildPlanRecord =>
+		self.manifest_ready.try_receive(self.manifest_receiver)
+
+	take_next_build_result :: (&mut self) -> ?BuildResultRecord =>
+		self.build_results.try_receive(self.result_receiver)
+
+	take_next_error :: (&mut self) -> ?PipelineError =>
+		self.pipeline_errors.try_receive(self.error_receiver)
+
+drain_build_requests :: (
+	state: &mut PipelineState,
+	signals: &mut PipelineSignals,
+	loader: &ManifestLoader,
+) -> !none => do
+	while true:
+		maybe_request := signals.take_next_build_request()
+		match maybe_request:
+			some request => do
+				path := String::clone(&request.manifest_path)
+				manifest := match loader.load(path):
+					ok manifest_value => manifest_value
+					err err_ => do
+						message := std_error_message(err_)
+						error_payload := PipelineError::ManifestLoad {
+							path: String::clone(&request.manifest_path),
+							message: message,
+						}
+								emit_result := signals.emit_error(error_payload)
+								match emit_result:
+									ok none => none
+									err send_err => ret err send_err
+						cont
+
+				plan := BuildPlanRecord {
+					request_id: request.id,
+					request: request,
+					manifest: manifest,
+				}
+				match signals.emit_manifest_ready(plan):
+					ok none => none
+					err send_err => ret err send_err
+			none => break
+	ret ok none
+
+drain_manifest_ready :: (state: &mut PipelineState, signals: &mut PipelineSignals) -> !none => do
+	while true:
+		maybe_plan := signals.take_next_manifest()
+		match maybe_plan:
+			some plan => do
+				stored := clone_build_plan(&plan)
+				state.record_plan(stored)
+				print_plan_summary(plan)
+				result := execute_build_plan(&plan)
+				match signals.emit_build_result(result):
+					ok none => none
+					err send_err => ret err send_err
+			none => break
+	ret ok none
+
+drain_build_results :: (state: &mut PipelineState, signals: &mut PipelineSignals) -> !none => do
+	while true:
+		maybe_result := signals.take_next_build_result()
+		match maybe_result:
+			some result => do
+				state.record_result(clone_build_result(&result))
+				print_build_result(result)
+			none => break
+	ret ok none
+
+drain_pipeline_errors :: (state: &mut PipelineState, signals: &mut PipelineSignals) -> !none => do
+	while true:
+		maybe_error := signals.take_next_error()
+		match maybe_error:
+			some err_ => do
+				state.record_error(clone_pipeline_error(&err_))
+				print_pipeline_error(err_)
+			none => break
+	ret ok none
+
+clone_string_list :: (source: [String]) -> [String] => do
+	clone := new [String]
+	for i in 0..source.len:
+		match source.get(i):
+			some value => do
+				clone.push(String::clone(&value))
+			none => do
+				cont
+	ret clone
+
+clone_dependency_source :: (source: DependencySource) -> DependencySource => match source:
+	DependencySource::Registry => DependencySource::Registry
+	DependencySource::Git :: struct { reference } => DependencySource::Git { reference: String::clone(&reference) }
+	DependencySource::Path :: struct { relative } => DependencySource::Path { relative: String::clone(&relative) }
+
+clone_dependency_spec :: (spec: DependencySpec) -> DependencySpec => DependencySpec {
+	name: String::clone(&spec.name),
+	requirement: String::clone(&spec.requirement),
+	source: clone_dependency_source(spec.source),
+}
+
+clone_dependency_list :: (specs: [DependencySpec]) -> [DependencySpec] => do
+	clone := new [DependencySpec]
+	for i in 0..specs.len:
+		match specs.get(i):
+			some entry => do
+				clone.push(clone_dependency_spec(entry))
+			none => do
+				cont
+	ret clone
+
+clone_manifest :: (manifest: &PackageManifest) -> PackageManifest => PackageManifest {
+	name: String::clone(&manifest.name),
+	version: String::clone(&manifest.version),
+	license: String::clone(&manifest.license),
+	description: String::clone(&manifest.description),
+	dependencies: clone_dependency_list(manifest.dependencies),
+}
+
+clone_build_request :: (source: &BuildRequestRecord) -> BuildRequestRecord => BuildRequestRecord {
+	id: source.id,
+	manifest_path: String::clone(&source.manifest_path),
+	targets: clone_string_list(source.targets),
+	release: source.release,
+	show_help: source.show_help,
+}
+
+clone_build_plan :: (source: &BuildPlanRecord) -> BuildPlanRecord => BuildPlanRecord {
+	request_id: source.request_id,
+	request: clone_build_request(&source.request),
+	manifest: clone_manifest(&source.manifest),
+}
+
+clone_build_result :: (source: &BuildResultRecord) -> BuildResultRecord => BuildResultRecord {
+	request_id: source.request_id,
+	package_name: String::clone(&source.package_name),
+	mode: String::clone(&source.mode),
+	success: source.success,
+	message: String::clone(&source.message),
+	artifacts: clone_string_list(source.artifacts),
+}
+
+clone_pipeline_error :: (source: &PipelineError) -> PipelineError => match *source:
+	PipelineError::ManifestLoad :: struct { path, message } =>
+		PipelineError::ManifestLoad {
+			path: String::clone(&path),
+			message: String::clone(&message),
+		}
+	PipelineError::CliParse :: struct { message } =>
+		PipelineError::CliParse { message: String::clone(&message) }
+
+execute_build_plan :: (plan: &BuildPlanRecord) -> BuildResultRecord => do
+	mode := build_mode_label(plan.request.release)
+	manifest_dir := manifest_directory_for_path(&plan.request.manifest_path)
+	build_targets := determine_build_targets(&plan.request, &manifest_dir)
+	relative_prefix := compute_relative_prefix(&manifest_dir)
+	compiler_manifest := relative_prefix + String::from_cstr("tricti-compiler/Cargo.toml" as *u8)
+	cd_dir := canonical_cd_directory(&manifest_dir)
+	artifacts := new [String]
+	success := true
+	message := String::new()
+
+	for i in 0..build_targets.len:
+		match build_targets.get(i):
+			some target => do
+				command := build_compiler_command(&cd_dir, &compiler_manifest, &target, plan.request.release)
+				preview := String::from_cstr("[tripm] run> " as *u8) + String::clone(&command)
+				println(preview)
+				exit_code := run_shell_command(command)
+				if exit_code == 0:
+					artifact_batch := collect_artifacts_for_target(&manifest_dir, &target)
+					for j in 0..artifact_batch.len:
+						match artifact_batch.get(j):
+							some entry => do
+								artifacts.push(entry)
+							none => do
+								cont
+				else:
+					success = false
+					message = format_failure_message(&target, exit_code)
+					break
+			none => do
+				cont
+
+	if success:
+		message = format_success_message(&plan.manifest.name, &build_targets)
+
+	BuildResultRecord {
+		request_id: plan.request_id,
+		package_name: String::clone(&plan.manifest.name),
+		mode: mode,
+		success: success,
+		message: message,
+		artifacts: artifacts,
+	}
+
+print_plan_summary :: (plan: BuildPlanRecord) => do
+	header := String::from_cstr("[tripm] manifest loaded" as *u8)
+	println(header)
+
+	request_id_str := String::from_u64(plan.request_id)
+	println(String::from_cstr("  request-id: " as *u8) + request_id_str)
+	println(String::from_cstr("  package: " as *u8) + plan.manifest.name)
+	println(String::from_cstr("  version: " as *u8) + plan.manifest.version)
+	println(String::from_cstr("  mode: " as *u8) + build_mode_label(plan.request.release))
+
+	if plan.manifest.dependencies.len == 0:
+		println(String::from_cstr("  dependencies: (none)" as *u8))
+	else:
+		println(String::from_cstr("  dependencies:" as *u8))
+		for i in 0..plan.manifest.dependencies.len:
+			match plan.manifest.dependencies.get(i):
+				some dep => do
+					line := format_dependency(dep)
+					println(String::from_cstr("    - " as *u8) + line)
+				none => do
+					cont
+
+print_pipeline_error :: (err_: PipelineError) => match err_:
+	PipelineError::ManifestLoad :: struct { path, message } => do
+		println(String::from_cstr("[tripm] manifest error" as *u8))
+		println(String::from_cstr("  path: " as *u8) + path)
+		println(String::from_cstr("  message: " as *u8) + message)
+	PipelineError::CliParse :: struct { message } => do
+		println(String::from_cstr("[tripm] cli parse error" as *u8))
+		println(String::from_cstr("  message: " as *u8) + message)
+
+print_build_result :: (result: BuildResultRecord) => do
+	println(String::from_cstr("[tripm] build result" as *u8))
+	println(String::from_cstr("  request-id: " as *u8) + String::from_u64(result.request_id))
+	println(String::from_cstr("  package: " as *u8) + result.package_name)
+	println(String::from_cstr("  mode: " as *u8) + result.mode)
+	if result.success:
+		println(String::from_cstr("  status: success" as *u8))
+	else:
+		println(String::from_cstr("  status: failed" as *u8))
+	println(String::from_cstr("  message: " as *u8) + result.message)
+	if result.artifacts.len == 0:
+		println(String::from_cstr("  artifacts: (none)" as *u8))
+	else:
+		println(String::from_cstr("  artifacts:" as *u8))
+		for i in 0..result.artifacts.len:
+			match result.artifacts.get(i):
+				some artifact => do
+					println(String::from_cstr("    - " as *u8) + artifact)
+				none => do
+					cont
+
+run_shell_command :: (command: String) -> i32 => do
+	c_command := marshal::string_to_cstr(command)
+	status := system(c_command)
+	marshal::free_cstr(c_command)
+	ret status
+
+manifest_directory_for_path :: (path: &String) -> String => do
+	if path.len == 0:
+		ret String::from_cstr("." as *u8)
+
+	last_slash := -1i64
+	for i in 0..path.len:
+		if path.data[i] == 47:
+			last_slash = i as i64
+
+	if last_slash < 0:
+		ret String::from_cstr("." as *u8)
+	if last_slash == 0:
+		ret String::from_cstr("." as *u8)
+
+	dir := String::substring(path, 0, last_slash as u64)
+	normalized := strip_leading_dot_slash(dir)
+	if normalized.len == 0:
+		ret String::from_cstr("." as *u8)
+	if normalized.len == 1 and normalized.data[0] == 46:
+		ret String::from_cstr("." as *u8)
+	ret normalized
+
+strip_leading_dot_slash :: (input: String) -> String =>
+	if input.len >= 2 and input.data[0] == 46 and input.data[1] == 47:
+		String::substring(&input, 2, input.len)
+	else:
+		input
+
+is_root_directory :: (path: &String) -> bool =>
+	path.len == 0 or (path.len == 1 and path.data[0] == 46)
+
+
+determine_build_targets :: (request: &BuildRequestRecord, manifest_dir: &String) -> [String] => do
+	tri_suffix := String::from_cstr(".tri" as *u8)
+	toml_suffix := String::from_cstr(".toml" as *u8)
+	targets := new [String]
+
+	for i in 0..request.targets.len:
+		match request.targets.get(i):
+			some candidate => do
+				if String::ends_with(&candidate, &toml_suffix):
+					cont
+				if String::ends_with(&candidate, &tri_suffix):
+					targets.push(candidate)
+			none => do
+				cont
+
+	if targets.len == 0:
+		default_target := resolve_default_target(manifest_dir)
+		targets.push(default_target)
+
+	ret targets
+
+resolve_default_target :: (manifest_dir: &String) -> String => do
+	main_candidate := String::from_cstr("src/main.tri" as *u8)
+	if manifest_relative_path_exists(manifest_dir, &main_candidate):
+		ret main_candidate
+
+	alt_candidate := String::from_cstr("src.tri" as *u8)
+	if manifest_relative_path_exists(manifest_dir, &alt_candidate):
+		ret alt_candidate
+
+	ret String::from_cstr("src/main.tri" as *u8)
+
+manifest_relative_path_exists :: (manifest_dir: &String, relative: &String) -> bool => do
+	absolute := join_components(manifest_dir, relative)
+	path_obj := Path::new(String::clone(&absolute))
+	ret Path::exists(&path_obj)
+
+join_components :: (left: &String, right: &String) -> String => do
+	if is_root_directory(left):
+		ret String::clone(right)
+
+	result := String::clone(left)
+	if result.len > 0 and result.data[result.len - 1] ~= 47:
+		String::push_char(&result, 47)
+	String::push_str(&result, right)
+	ret result
+
+
+compute_relative_prefix :: (dir: &String) -> String => do
+	if is_root_directory(dir):
+		ret String::new()
+
+	segments := count_path_segments(dir)
+	prefix := String::new()
+	up := String::from_cstr("../" as *u8)
+	for _ in 0..segments:
+		String::push_str(&prefix, &up)
+	ret prefix
+
+count_path_segments :: (dir: &String) -> u64 => do
+	if dir.len == 0:
+		ret 0
+	count := 1u64
+	for i in 0..dir.len:
+		if dir.data[i] == 47:
+			count += 1
+	ret count
+
+canonical_cd_directory :: (dir: &String) -> String =>
+	if is_root_directory(dir):
+		String::from_cstr("." as *u8)
+	else:
+		String::clone(dir)
+
+
+build_compiler_command :: (cd_dir: &String, compiler_manifest: &String, target: &String, release: bool) -> String => do
+	command := String::from_cstr("cd " as *u8)
+	String::push_str(&command, cd_dir)
+	String::push_str(&command, &String::from_cstr(" && SKIP_STDLIB=0 cargo run --manifest-path " as *u8))
+	String::push_str(&command, compiler_manifest)
+	if release:
+		String::push_str(&command, &String::from_cstr(" --release" as *u8))
+	String::push_str(&command, &String::from_cstr(" -- " as *u8))
+	String::push_str(&command, target)
+	ret command
+
+
+format_success_message :: (package_name: &String, targets: &[String]) -> String => do
+	count := targets.len
+	count_str := String::from_u64(count)
+	message := String::from_cstr("Build completed for " as *u8) + String::clone(package_name)
+	if count > 0:
+		String::push_str(&message, &String::from_cstr(" (targets: " as *u8))
+		joined := join_target_list(targets)
+		String::push_str(&message, &joined)
+		String::push_str(&message, &String::from_cstr(")" as *u8))
+	String::push_str(&message, &String::from_cstr(" [" as *u8))
+	String::push_str(&message, &count_str)
+	String::push_str(&message, &String::from_cstr("]" as *u8))
+	ret message
+
+join_target_list :: (targets: &[String]) -> String => do
+	joined := String::new()
+	for i in 0..targets.len:
+		if i > 0:
+			String::push_str(&joined, &String::from_cstr(", " as *u8))
+		match targets.get(i):
+			some item => do
+				String::push_str(&joined, &item)
+			none => do
+				cont
+	ret joined
+
+format_failure_message :: (target: &String, exit_code: i32) -> String => do
+	message := String::from_cstr("Build failed for target " as *u8)
+	String::push_str(&message, target)
+	String::push_str(&message, &String::from_cstr(" (status " as *u8))
+	code_str := String::from_i64(exit_code as i64)
+	String::push_str(&message, &code_str)
+	String::push_str(&message, &String::from_cstr(")" as *u8))
+	ret message
+
+ensure_build_directory :: (manifest_dir: &String) -> String => do
+	build_segment := String::from_cstr("build" as *u8)
+	build_path := join_components(manifest_dir, &build_segment)
+	exists := io::dir::exists(String::clone(&build_path))
+	if exists:
+		ret build_path
+
+	create_status := io::dir::create_dir(String::clone(&build_path))
+	ret build_path
+
+sanitize_target_name :: (target: &String) -> String => do
+	sanitized := String::new()
+	for i in 0..target.len:
+		ch := target.data[i]
+		if ch == 47 or ch == 92 or ch == 32:
+			String::push_char(&sanitized, 95)
+		else:
+			String::push_char(&sanitized, ch)
+	if sanitized.len == 0:
+		ret String::from_cstr("target" as *u8)
+	ret sanitized
+
+collect_artifacts_for_target :: (manifest_dir: &String, target: &String) -> [String] => do
+	results := new [String]
+	build_dir := ensure_build_directory(manifest_dir)
+	sanitized := sanitize_target_name(target)
+
+	binary_name := String::from_cstr("output.out" as *u8)
+	binary_suffix := String::from_cstr(".out" as *u8)
+	binary_path := move_artifact_if_exists(manifest_dir, &build_dir, &binary_name, &sanitized, &binary_suffix)
+	match binary_path:
+		some final_path => do
+			results.push(final_path)
+		none => do
+			source_path := join_components(manifest_dir, &binary_name)
+			exists := io::dir::exists(String::clone(&source_path))
+			if exists:
+				results.push(source_path)
+
+	object_name := String::from_cstr("output.o" as *u8)
+	object_suffix := String::from_cstr(".o" as *u8)
+	object_path := move_artifact_if_exists(manifest_dir, &build_dir, &object_name, &sanitized, &object_suffix)
+	match object_path:
+		some final_path => do
+			results.push(final_path)
+		none => do
+			source_path := join_components(manifest_dir, &object_name)
+			exists := io::dir::exists(String::clone(&source_path))
+			if exists:
+				results.push(source_path)
+
+	ret results
+
+move_artifact_if_exists :: (manifest_dir: &String, build_dir: &String, source_name: &String, sanitized: &String, suffix: &String) -> ?String => do
+	source_path := join_components(manifest_dir, source_name)
+	exists := io::dir::exists(String::clone(&source_path))
+	if exists == false:
+		ret none
+
+	dest_filename := sanitized_with_suffix(sanitized, suffix)
+	dest_path := join_components(build_dir, &dest_filename)
+	remove_status := io::dir::remove_file(String::clone(&dest_path))
+	renamed := io::dir::rename(String::clone(&source_path), String::clone(&dest_path))
+	if renamed:
+		ret some dest_path
+	ret none
+
+sanitized_with_suffix :: (sanitized: &String, suffix: &String) -> String => do
+	combined := String::clone(sanitized)
+	String::push_str(&combined, suffix)
+	ret combined
+
+format_dependency :: (spec: DependencySpec) -> String => match spec.source:
+	DependencySource::Registry => spec.name + String::from_cstr(" (registry)" as *u8)
+	DependencySource::Git :: struct { reference } => spec.name + String::from_cstr(" (git " as *u8) + reference + String::from_cstr(")" as *u8)
+	DependencySource::Path :: struct { relative } => spec.name + String::from_cstr(" (path " as *u8) + relative + String::from_cstr(")" as *u8)
+
+determine_manifest_path :: (targets: &[String]) -> String => do
+	toml_suffix := String::from_cstr(".toml" as *u8)
+	selected := String::from_cstr("Package.toml" as *u8)
+	for i in 0..targets.len:
+		match targets.get(i):
+			some candidate => do
+				if String::ends_with(&candidate, &toml_suffix):
+					selected = String::clone(&candidate)
+			none => do
+				cont
+	ret selected
+
+build_mode_label :: (release: bool) -> String =>
+	if release:
+		String::from_cstr("release" as *u8)
+	else:
+		String::from_cstr("debug" as *u8)
+
+render_generic_help :: () => do
+	println(String::from_cstr("TriCTI Package Manager (tripm)" as *u8))
+	println(String::from_cstr("Usage:" as *u8))
+	println(String::from_cstr("  tripm build [targets] [--release]" as *u8))
+	println(String::from_cstr("  tripm fetch" as *u8))
+	println(String::from_cstr("  tripm init" as *u8))
+	println(String::from_cstr("  tripm check" as *u8))
+
+render_build_help :: () => do
+	println(String::from_cstr("tripm build" as *u8))
+	println(String::from_cstr("  --release    Produce optimized artifacts" as *u8))
+	println(String::from_cstr("  --debug      Force debug build" as *u8))
+	println(String::from_cstr("  targets      Optional build targets" as *u8))
+
+render_pipeline_snapshot :: (state: &PipelineState) => do
+	println(String::from_cstr("[tripm] pipeline snapshot" as *u8))
+	println(String::from_cstr("  cli-events: " as *u8) + String::from_u64(state.cli_events.len))
+	println(String::from_cstr("  build-requests: " as *u8) + String::from_u64(state.build_requests.len))
+	println(String::from_cstr("  build-plans: " as *u8) + String::from_u64(state.build_plans.len))
+	println(String::from_cstr("  build-results: " as *u8) + String::from_u64(state.build_results.len))
+	println(String::from_cstr("  errors: " as *u8) + String::from_u64(state.errors.len))
+
+run_build_command :: (
+	state: &mut PipelineState,
+	signals: &mut PipelineSignals,
+	targets: [String],
+	release: bool,
+	show_help: bool,
+) -> !none => do
+	if show_help:
+		render_build_help()
+		ret ok none
+
+	request_targets := clone_string_list(targets)
+	manifest_path := determine_manifest_path(&request_targets)
+	request_id := state.allocate_id()
+
+	request := BuildRequestRecord {
+		id: request_id,
+		manifest_path: manifest_path,
+		targets: request_targets,
+		release: release,
+		show_help: show_help,
+	}
+
+	state.record_build_request(clone_build_request(&request))
+
+	manifest_display := String::clone(&request.manifest_path)
+	mode_label := build_mode_label(request.release)
+	target_label := join_target_list(&request.targets)
+	target_count := request.targets.len
+
+	println(String::from_cstr("[tripm] enqueue build request" as *u8))
+	println(String::from_cstr("  manifest: " as *u8) + manifest_display)
+	println(String::from_cstr("  mode: " as *u8) + mode_label)
+	if target_count == 0:
+		println(String::from_cstr("  targets: (using src/main.tri)" as *u8))
+	else:
+		println(String::from_cstr("  targets: " as *u8) + target_label)
+
+	emit_status := signals.emit_build_request(request)
+	match emit_status:
+		ok none => none
+		err err_ => ret err err_
+
+	project_root := current_project_root()
+	loader := ManifestLoader::new(project_root)
+
+	match drain_build_requests(state, signals, &loader):
+		ok none => none
+		err err_ => ret err err_
+
+	match drain_manifest_ready(state, signals):
+		ok none => none
+		err err_ => ret err err_
+
+	match drain_build_results(state, signals):
+		ok none => none
+		err err_ => ret err err_
+
+	match drain_pipeline_errors(state, signals):
+		ok none => none
+		err err_ => ret err err_
+
+	ret ok none
+
+current_project_root :: () -> String => String::from_cstr("." as *u8)
+
+main :: () => do
+	command_line := CommandLine::current()
+	state := PipelineState::new()
+
+	args := command_line.slice_from(0)
+	cli_record_id := state.record_cli(args)
+
+	signals := match PipelineSignals::new():
+		ok value => value
+		err err_ => do
+			message := std_error_message(err_)
+			println(String::from_cstr("[tripm] failed to initialize signals" as *u8))
+			println(String::from_cstr("  message: " as *u8) + message)
+			ret
+
+	invocation := match CliInvocation::parse(command_line):
+		ok parsed => parsed
+		err err_ => do
+			message := std_error_message(err_)
+			pipeline_err := PipelineError::CliParse { message: message }
+			state.record_error(clone_pipeline_error(&pipeline_err))
+			print_pipeline_error(pipeline_err)
+			ret
+
+	match invocation.command:
+		CliCommand::Help => do
+			render_generic_help()
+		CliCommand::Fetch => do
+			println(String::from_cstr("[tripm] fetch is not implemented yet" as *u8))
+		CliCommand::Init => do
+			println(String::from_cstr("[tripm] init is not implemented yet" as *u8))
+		CliCommand::Check => do
+			println(String::from_cstr("[tripm] check is not implemented yet" as *u8))
+		CliCommand::Build :: struct { targets, release, show_help } => do
+			build_execution := run_build_command(&mut state, &mut signals, targets, release, show_help)
+			match build_execution:
+				ok none => none
+				err err_ => ret err err_
+		other => do
+			println(String::from_cstr("[tripm] unsupported command" as *u8))
+	render_pipeline_snapshot(&state)

@@ -18,12 +18,11 @@ DependencySpec :: struct
     requirement: String,
     source: DependencySource,
 
-DependencySource :: enum
+DependencySource :: enum {
     Registry,
-    Git :: struct
-        reference: String,
-    Path :: struct
-        relative: String,
+    Git { reference: String },
+    Path { relative: String },
+}
 
 ManifestLoader :: struct
     root_path: String,
@@ -33,9 +32,20 @@ impl ManifestLoader:
 
     load :: (&self, relative_path: String) -> !PackageManifest => do
         manifest_path := self.join_path(relative_path)
-        file := File::open(manifest_path, FileMode::Read)?
-        contents := file.read_to_string()?
-        self.parse(contents)
+        open_result := File::open(manifest_path, FileMode::Read)
+        file := match open_result:
+            ok handle => handle
+            err err_ => ret err err_
+
+        read_result := file.read_to_string()
+        contents := match read_result:
+            ok data => data
+            err err_ => ret err err_
+
+        parse_result := self.parse(contents)
+        match parse_result:
+            ok manifest => ret ok manifest
+            err err_ => ret err err_
 
     join_path :: (&self, relative: String) -> String => do
         base := String::clone(&self.root_path)
@@ -53,21 +63,31 @@ impl ManifestLoader:
         section := ParseSection::Root
 
         for i in 0..lines.len:
-            line := lines.get(i)?
-            trimmed := String::trim(&line)
-            if trimmed.len == 0:
-                cont
-            first := trimmed.data[0]
-            if first == 35:
-                cont
+            match lines.get(i):
+                some line => do
+                    trimmed := String::trim(&line)
+                    if trimmed.len == 0:
+                        cont
+                    first := trimmed.data[0]
+                    if first == 35:
+                        cont
 
-            if first == 91 and trimmed.data[trimmed.len - 1] == 93:
-                section = ManifestLoader::parse_section(trimmed)
-                cont
+                    if first == 91 and trimmed.data[trimmed.len - 1] == 93:
+                        section = ManifestLoader::parse_section(trimmed)
+                        cont
 
-            match section:
-                ParseSection::Root => ManifestLoader::parse_root_kv(trimmed, &mut manifest)?
-                ParseSection::Dependencies => ManifestLoader::parse_dependency(trimmed, &mut manifest)?
+                    match section:
+                        ParseSection::Root => do
+                            root_result := ManifestLoader::parse_root_kv(trimmed, &mut manifest)
+                            match root_result:
+                                ok none => none
+                                err err_ => ret err err_
+                        ParseSection::Dependencies => do
+                            dep_result := ManifestLoader::parse_dependency(trimmed, &mut manifest)
+                            match dep_result:
+                                ok none => none
+                                err err_ => ret err err_
+                none => cont
         ret ok manifest
 
     parse_section :: (line: String) -> ParseSection => do
@@ -80,7 +100,10 @@ impl ManifestLoader:
             ret ParseSection::Unknown
 
     parse_root_kv :: (line: String, manifest: &mut PackageManifest) -> !none => do
-    pair := split_key_value(line)?
+        pair_result := split_key_value(line)
+        pair := match pair_result:
+            ok kv => kv
+            err err_ => ret err err_
         key := String::trim(&pair.key)
         value := normalize_value(pair.value)
 
@@ -97,7 +120,10 @@ impl ManifestLoader:
         ret ok none
 
     parse_dependency :: (line: String, manifest: &mut PackageManifest) -> !none => do
-        pair := split_key_value(line)?
+        pair_result := split_key_value(line)
+        pair := match pair_result:
+            ok kv => kv
+            err err_ => ret err err_
         name := String::trim(&pair.key)
         requirement_raw := String::trim(&pair.value)
         requirement := normalize_value(requirement_raw)
@@ -111,10 +137,11 @@ impl ManifestLoader:
         manifest.dependencies.push(spec)
         ret ok none
 
-ParseSection :: enum
+ParseSection :: enum {
     Root,
     Dependencies,
     Unknown,
+}
 
 KeyValue :: struct
     key: String,

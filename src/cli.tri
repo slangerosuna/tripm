@@ -6,15 +6,13 @@ use core::collections
 use core::errors
 use core::string
 
-CliCommand :: enum
-    Build :: struct
-        targets: [String],
-        release: bool,
-        show_help: bool,
-    Fetch,
-    Init,
-    Check,
-    Help,
+CliCommand :: enum {
+    Build(BuildOptions)
+    Fetch
+    Init
+    Check
+    Help
+}
 
 CliInvocation :: struct
     command: CliCommand,
@@ -27,28 +25,29 @@ impl CliInvocation:
                 command: CliCommand::Help,
             }
 
-        first := args.get(0)?
-        if String::equals(&first, &String::from_cstr("build" as *u8)):
-            options := CliInvocation::parse_build_options(args)
-            ret ok CliInvocation {
-                command: CliCommand::Build {
-                    targets: options.targets,
-                    release: options.release,
-                    show_help: options.show_help,
-                },
-            }
-        elif String::equals(&first, &String::from_cstr("fetch" as *u8)):
-            ret ok CliInvocation { command: CliCommand::Fetch }
-        elif String::equals(&first, &String::from_cstr("init" as *u8)):
-            ret ok CliInvocation { command: CliCommand::Init }
-        elif String::equals(&first, &String::from_cstr("check" as *u8)):
-            ret ok CliInvocation { command: CliCommand::Check }
-        elif String::equals(&first, &String::from_cstr("help" as *u8))
-            or String::equals(&first, &String::from_cstr("--help" as *u8)):
-            ret ok CliInvocation { command: CliCommand::Help }
-        else:
-            msg := CliInvocation::unknown_command_message(first)
-            ret err StdError::Message(msg)
+        match args.get(0):
+            some first => do
+                if String::equals(&first, &String::from_cstr("build" as *u8)):
+                    options := CliInvocation::parse_build_options(args)
+                    ret ok CliInvocation {
+                        command: CliCommand::Build(BuildOptions {
+                            targets: options.targets,
+                            release: options.release,
+                            show_help: options.show_help,
+                        }),
+                    }
+                elif String::equals(&first, &String::from_cstr("fetch" as *u8)):
+                    ret ok CliInvocation { command: CliCommand::Fetch }
+                elif String::equals(&first, &String::from_cstr("init" as *u8)):
+                    ret ok CliInvocation { command: CliCommand::Init }
+                elif String::equals(&first, &String::from_cstr("check" as *u8)):
+                    ret ok CliInvocation { command: CliCommand::Check }
+                elif String::equals(&first, &String::from_cstr("help" as *u8)) or String::equals(&first, &String::from_cstr("--help" as *u8)):
+                    ret ok CliInvocation { command: CliCommand::Help }
+                else:
+                    msg := CliInvocation::unknown_command_message(first)
+                    ret err StdError::Message(msg)
+            none => ret err StdError::Message(String::from_cstr("missing command" as *u8))
 
     parse_build_options :: (args: [String]) -> BuildOptions => do
         options := BuildOptions::new()
@@ -56,15 +55,18 @@ impl CliInvocation:
             ret options
 
         for i in 1..args.len:
-            arg := args.get(i)?
-            if String::equals(&arg, &String::from_cstr("--release" as *u8)):
-                options.release = true
-            elif String::equals(&arg, &String::from_cstr("--debug" as *u8)):
-                options.release = false
-            elif String::equals(&arg, &String::from_cstr("--help" as *u8)):
-                options.show_help = true
-            else:
-                options.targets.push(arg)
+            match args.get(i):
+                some arg => do
+                    if String::equals(&arg, &String::from_cstr("--release" as *u8)):
+                        options.release = true
+                    elif String::equals(&arg, &String::from_cstr("--debug" as *u8)):
+                        options.release = false
+                    elif String::equals(&arg, &String::from_cstr("--help" as *u8)):
+                        options.show_help = true
+                    else:
+                        options.targets.push(arg)
+                none => do
+                    cont
         ret options
 
     unknown_command_message :: (command: String) -> String => do
