@@ -769,7 +769,7 @@ run_build_command :: sys (
 				println(String::from_cstr("  targets: (using src/main.tri)" as *u8))
 			else:
 				println(String::from_cstr("  targets: " as *u8) + target_label)
-			err err_ => do
+		err err_ => do
 			message := std_error_message(err_)
 			println(String::from_cstr("[tripm] build enqueue failed" as *u8))
 			println(String::from_cstr("  message: " as *u8) + message)
@@ -826,15 +826,20 @@ main :: () => do
 		CliCommand::Check => do
 			println(String::from_cstr("[tripm] check is not implemented yet" as *u8))
 		CliCommand::Build :: struct { targets, release, show_help } => do
-			match run_build_command(&mut runtime, &mut db, &mut bus, targets, release, show_help):
-				ok none => match drive_tripm_pipeline(&mut runtime, &mut db, &mut bus):
-					ok none => none
-					err err_ => do
-						message := std_error_message(err_)
-						println(String::from_cstr("[tripm] pipeline pump failed" as *u8))
-						println(String::from_cstr("  message: " as *u8) + message)
-					err _ => ret
+			match run_build_command(&mut runtime, &mut db_, &mut bus, targets, release, show_help):
+				ok none => do
+					match drive_tripm_pipeline(&mut runtime, &mut db_, &mut bus):
+						ok none => none
+						err err_ => do
+							message := std_error_message(err_)
+							println(String::from_cstr("[tripm] pipeline pump failed" as *u8))
+							println(String::from_cstr("  message: " as *u8) + message)
+							ret
+				err err_ => do
+					message := std_error_message(err_)
+					println(String::from_cstr("[tripm] build command failed" as *u8))
+					println(String::from_cstr("  message: " as *u8) + message)
+					ret
 		other => do
 			println(String::from_cstr("[tripm] unsupported command" as *u8))
-
 	render_pipeline_snapshot(&db_)

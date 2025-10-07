@@ -18,11 +18,12 @@ DependencySpec :: struct
     requirement: String,
     source: DependencySource,
 
-DependencySource :: enum {
+DependencySource :: enum
     Registry,
-    Git { reference: String },
-    Path { relative: String },
-}
+    Git :: struct
+        reference: String,
+    Path :: struct
+        relative: String,
 
 ManifestLoader :: struct
     root_path: String,
@@ -137,11 +138,10 @@ impl ManifestLoader:
         manifest.dependencies.push(spec)
         ret ok none
 
-ParseSection :: enum {
+ParseSection :: enum
     Root,
     Dependencies,
     Unknown,
-}
 
 KeyValue :: struct
     key: String,
@@ -169,7 +169,7 @@ split_lines :: (input: String) -> [String] => do
             String::push_char(&current, ch)
     if current.len > 0:
         lines.push(current)
-    ret lines
+    lines
 
 split_key_value :: (line: String) -> !KeyValue => do
     maybe_position := find_equals(line)
