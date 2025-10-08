@@ -163,17 +163,17 @@ impl TripmBus:
 
 record_cli_event :: sys (
 	runtime: res &mut TripmRuntime,
-	db: res &mut TripmDbState,
+	db_: res &mut TripmDbState,
 	@sys_input args: [String],
 ) -> !u64 => do
 	id := runtime.allocate_id()
 	stored_args := clone_string_list(args)
-	db.cli_events.push(CliEvent { id: id, args: stored_args })
+	db_.cli_events.push(CliEvent { id: id, args: stored_args })
 	ret ok id
 
 record_build_request :: sys (
 	runtime: res &mut TripmRuntime,
-	db: res &mut TripmDbState,
+	db_: res &mut TripmDbState,
 	bus: res &mut TripmBus,
 	@sys_input manifest_path: String,
 	@sys_input targets: [String],
@@ -189,7 +189,7 @@ record_build_request :: sys (
 		release: release,
 		show_help: show_help,
 	}
-	db.build_requests.push(clone_build_request(&request))
+	db_.build_requests.push(clone_build_request(&request))
 	match bus.emit_build_request(clone_build_request(&request)):
 		ok none => none
 		err err_ => ret err err_
@@ -204,7 +204,7 @@ poll_build_request :: sys (
 
 load_manifest_for_request :: sys (
 	runtime: res &mut TripmRuntime,
-	db: res &mut TripmDbState,
+	db_: res &mut TripmDbState,
 	@sys_input request: BuildRequestRecord,
 ) -> !?BuildPlanRecord => do
 	loader := runtime.manifest_loader()
@@ -231,15 +231,15 @@ load_manifest_for_request :: sys (
 				request_id: event.request_id,
 				error: clone_pipeline_error(&event.error),
 			}
-			db.pipeline_errors.push(record)
+			db_.pipeline_errors.push(record)
 			print_pipeline_error_event(event)
 			ret ok none
 
 prepare_manifest_outputs :: sys (
-	db: res &mut TripmDbState,
+	db_: res &mut TripmDbState,
 	@sys_input plan: BuildPlanRecord,
 ) -> !BuildPlanRecord => do
-	db.build_plans.push(clone_build_plan(&plan))
+	db_.build_plans.push(clone_build_plan(&plan))
 	print_plan_summary(clone_build_plan(&plan))
 	ret ok plan
 
@@ -250,36 +250,36 @@ execute_build_plan_stage :: sys (
 	ret ok result
 
 finalize_build_result :: sys (
-	db: res &mut TripmDbState,
+	db_: res &mut TripmDbState,
 	@sys_input result: BuildResultRecord,
 ) -> !none => do
-	db.build_results.push(clone_build_result(&result))
+	db_.build_results.push(clone_build_result(&result))
 	print_build_result(result)
 	ret ok none
 
 drive_tripm_pipeline_once :: sys (
 	runtime: res &mut TripmRuntime,
-	db: res &mut TripmDbState,
+	db_: res &mut TripmDbState,
 	bus: res &mut TripmBus,
 ) -> !bool => do
 	match poll_build_request(bus)?:
 		some request => do
-			match load_manifest_for_request(runtime, db, request)?:
+			match load_manifest_for_request(runtime, db_, request)?:
 				some plan => do
-					prepared_plan := prepare_manifest_outputs(db, plan)?
+					prepared_plan := prepare_manifest_outputs(db_, plan)?
 					result := execute_build_plan_stage(prepared_plan)?
-					finalize_build_result(db, result)?
+					finalize_build_result(db_, result)?
 					ret ok true
 				none => ret ok true
 		none => ret ok false
 
 drive_tripm_pipeline :: sys (
 	runtime: res &mut TripmRuntime,
-	db: res &mut TripmDbState,
+	db_: res &mut TripmDbState,
 	bus: res &mut TripmBus,
 ) -> !none => do
 	while true:
-		processed := drive_tripm_pipeline_once(runtime, db, bus)?
+		processed := drive_tripm_pipeline_once(runtime, db_, bus)?
 		if not processed:
 			break
 	ret ok none
@@ -539,14 +539,14 @@ manifest_relative_path_exists :: (manifest_dir: &String, relative: &String) -> b
 	path_obj := Path::new(String::clone(&absolute))
 	ret Path::exists(&path_obj)
 
-join_components :: (left: &String, right: &String) -> String => do
-	if is_root_directory(left):
-		ret String::clone(right)
+join_components :: (left_: &String, right_: &String) -> String => do
+	if is_root_directory(left_):
+		ret String::clone(right_)
 
-	result := String::clone(left)
+	result := String::clone(left_)
 	if result.len > 0 and result.data[result.len - 1] ~= 47:
 		String::push_char(&result, 47)
-	String::push_str(&result, right)
+	String::push_str(&result, right_)
 	ret result
 
 
