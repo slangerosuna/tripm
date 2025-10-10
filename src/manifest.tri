@@ -33,20 +33,9 @@ impl ManifestLoader:
 
     load :: (&self, relative_path: String) -> !PackageManifest => do
         manifest_path := self.join_path(relative_path)
-        open_result := File::open(manifest_path, FileMode::Read)
-        file := match open_result:
-            ok handle => handle
-            err err_ => ret err err_
-
-        read_result := file.read_to_string()
-        contents := match read_result:
-            ok data => data
-            err err_ => ret err err_
-
-        parse_result := self.parse(contents)
-        match parse_result:
-            ok manifest => ret ok manifest
-            err err_ => ret err err_
+        file := File::open(manifest_path, FileMode::Read)
+        contents := file.read_to_string()
+        ret self.parse(contents)?
 
     join_path :: (&self, relative: String) -> String => do
         base := String::clone(&self.root_path)
