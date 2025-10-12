@@ -140,14 +140,14 @@ impl TripmBus:
 		)
 		build_sender := match build_requests.register_sender():
 			ok sender_id => sender_id
-			err err_ => do
-				message := std_error_message(err_)
+			err failure => do
+				message := std_error_message(failure)
 				println(String::from_cstr("[tripm] failed to initialize build request signal" as *u8))
 				println(String::from_cstr("  message: " as *u8) + message)
-				ret err err_
+				ret err failure
 		build_receiver := match build_requests.register_receiver():
 			ok receiver_id => receiver_id
-			err err_ => ret err err_
+			err failure => ret err failure
 
 		ret ok TripmBus {
 			build_requests: build_requests,
@@ -192,7 +192,7 @@ record_build_request :: sys (
 	db_.build_requests.push(clone_build_request(&request))
 	match bus.emit_build_request(clone_build_request(&request)):
 		ok none => none
-		err err_ => ret err err_
+		err failure => ret err failure
 	ret ok request
 
 TripmPipelineTick :: Signal<Mpsc, Buffer, none>
@@ -217,8 +217,8 @@ load_manifest_for_request :: sys (
 				manifest: manifest,
 			}
 			ret ok some plan
-		err err_ => do
-			message := std_error_message(err_)
+		err failure => do
+			message := std_error_message(failure)
 			event := PipelineErrorEvent {
 				request_id: some request.id,
 				error: PipelineError::ManifestLoad {
@@ -278,10 +278,9 @@ drive_tripm_pipeline :: sys (
 	db_: res &mut TripmDbState,
 	bus: res &mut TripmBus,
 ) -> !none => do
-	while true:
+	loop:
 		processed := drive_tripm_pipeline_once(runtime, db_, bus)?
-		if not processed:
-			break
+		if not processed: break
 	ret ok none
 
 @trigger TripmPipelineTick, TripmDatabase
@@ -365,7 +364,9 @@ execute_build_plan :: (plan: &BuildPlanRecord) -> BuildResultRecord => do
 	manifest_dir := manifest_directory_for_path(&plan.request.manifest_path)
 	build_targets := determine_build_targets(&plan.request, &manifest_dir)
 	relative_prefix := compute_relative_prefix(&manifest_dir)
-	compiler_manifest := relative_prefix + String::from_cstr("tricti-compiler/Cargo.toml" as *u8)
+	compiler_root := relative_prefix + String::from_cstr("tricti-compiler" as *u8)
+	compiler_manifest := String::clone(&compiler_root) + String::from_cstr("/Cargo.toml" as *u8)
+	stdlib_dir := resolve_stdlib_directory(&manifest_dir, &compiler_root)
 	cd_dir := canonical_cd_directory(&manifest_dir)
 	artifacts := new [String]
 	success := true
@@ -374,7 +375,7 @@ execute_build_plan :: (plan: &BuildPlanRecord) -> BuildResultRecord => do
 	for i in 0..build_targets.len:
 		match build_targets.get(i):
 			some target => do
-				command := build_compiler_command(&cd_dir, &compiler_manifest, &target, plan.request.release)
+				command := build_compiler_command(&cd_dir, &compiler_manifest, &stdlib_dir, &target, plan.request.release)
 				preview := String::from_cstr("[tripm] run> " as *u8) + String::clone(&command)
 				println(preview)
 				exit_code := run_shell_command(command)
@@ -427,7 +428,7 @@ print_plan_summary :: (plan: BuildPlanRecord) => do
 				none => do
 					cont
 
-print_pipeline_error :: (err_: PipelineError) => match err_:
+print_pipeline_error :: (pipeline_error: PipelineError) => match pipeline_error:
 	PipelineError::ManifestLoad :: struct { path, message } => do
 		println(String::from_cstr("[tripm] manifest error" as *u8))
 		println(String::from_cstr("  path: " as *u8) + path)
@@ -550,6 +551,15 @@ join_components :: (left_: &String, right_: &String) -> String => do
 	ret result
 
 
+resolve_stdlib_directory :: (manifest_dir: &String, compiler_root: &String) -> String => do
+	override_target := String::from_cstr("stdlib/std.tri" as *u8)
+	if manifest_relative_path_exists(manifest_dir, &override_target):
+		override_dir := String::from_cstr("stdlib" as *u8)
+		ret join_components(manifest_dir, &override_dir)
+
+	ret String::clone(compiler_root) + String::from_cstr("/stdlib" as *u8)
+
+
 compute_relative_prefix :: (dir: &String) -> String => do
 	if is_root_directory(dir):
 		ret String::new()
@@ -577,14 +587,17 @@ canonical_cd_directory :: (dir: &String) -> String =>
 		String::clone(dir)
 
 
-build_compiler_command :: (cd_dir: &String, compiler_manifest: &String, target: &String, release: bool) -> String => do
+build_compiler_command :: (cd_dir: &String, compiler_manifest: &String, stdlib_dir: &String, target: &String, release: bool) -> String => do
 	command := String::from_cstr("cd " as *u8)
 	String::push_str(&command, cd_dir)
-	String::push_str(&command, &String::from_cstr(" && SKIP_STDLIB=0 cargo run --manifest-path " as *u8))
+	String::push_str(&command, &String::from_cstr(" && TRICTI_STDLIB_DIR=" as *u8))
+	String::push_str(&command, stdlib_dir)
+	String::push_str(&command, &String::from_cstr(" cargo run --manifest-path " as *u8))
 	String::push_str(&command, compiler_manifest)
 	if release:
 		String::push_str(&command, &String::from_cstr(" --release" as *u8))
-	String::push_str(&command, &String::from_cstr(" -- " as *u8))
+	String::push_str(&command, &String::from_cstr(" --bin tricti" as *u8))
+	String::push_str(&command, &String::from_cstr(" -- --no-run " as *u8))
 	String::push_str(&command, target)
 	ret command
 
@@ -703,7 +716,7 @@ format_dependency :: (spec: DependencySpec) -> String => match spec.source:
 
 determine_manifest_path :: (targets: &[String]) -> String => do
 	toml_suffix := String::from_cstr(".toml" as *u8)
-	selected := String::from_cstr("Package.toml" as *u8)
+	selected := String::from_cstr("manifest.toml" as *u8)
 	for i in 0..targets.len:
 		match targets.get(i):
 			some candidate => do
@@ -769,11 +782,11 @@ run_build_command :: sys (
 				println(String::from_cstr("  targets: (using src/main.tri)" as *u8))
 			else:
 				println(String::from_cstr("  targets: " as *u8) + target_label)
-		err err_ => do
-			message := std_error_message(err_)
+		err failure => do
+			message := std_error_message(failure)
 			println(String::from_cstr("[tripm] build enqueue failed" as *u8))
 			println(String::from_cstr("  message: " as *u8) + message)
-			ret err err_
+			ret err failure
 
 	ret ok none
 
@@ -785,8 +798,8 @@ main :: () => do
 	db_ := TripmDbState::new()
 	bus := match TripmBus::new():
 		ok value => value
-		err err_ => do
-			message := std_error_message(err_)
+		err failure => do
+			message := std_error_message(failure)
 			println(String::from_cstr("[tripm] failed to initialize signals" as *u8))
 			println(String::from_cstr("  message: " as *u8) + message)
 			ret
@@ -794,15 +807,15 @@ main :: () => do
 	args := command_line.slice_from(0)
 	match record_cli_event(&mut runtime, &mut db_, args):
 		ok _ => none
-		err err_ => do
-			message := std_error_message(err_)
+		err failure => do
+			message := std_error_message(failure)
 			println(String::from_cstr("[tripm] failed to record CLI event" as *u8))
 			println(String::from_cstr("  message: " as *u8) + message)
 
 	invocation := match CliInvocation::parse(command_line):
 		ok parsed => parsed
-		err err_ => do
-			message := std_error_message(err_)
+		err failure => do
+			message := std_error_message(failure)
 			event := PipelineErrorEvent {
 				request_id: none,
 				error: PipelineError::CliParse { message: message },
@@ -830,13 +843,13 @@ main :: () => do
 				ok none => do
 					match drive_tripm_pipeline(&mut runtime, &mut db_, &mut bus):
 						ok none => none
-						err err_ => do
-							message := std_error_message(err_)
+						err failure => do
+							message := std_error_message(failure)
 							println(String::from_cstr("[tripm] pipeline pump failed" as *u8))
 							println(String::from_cstr("  message: " as *u8) + message)
 							ret
-				err err_ => do
-					message := std_error_message(err_)
+				err failure => do
+				message := std_error_message(failure)
 					println(String::from_cstr("[tripm] build command failed" as *u8))
 					println(String::from_cstr("  message: " as *u8) + message)
 					ret

@@ -71,12 +71,12 @@ impl ManifestLoader:
                             root_result := ManifestLoader::parse_root_kv(trimmed, &mut manifest)
                             match root_result:
                                 ok none => none
-                                err err_ => ret err err_
+                                err failure => ret err failure
                         ParseSection::Dependencies => do
                             dep_result := ManifestLoader::parse_dependency(trimmed, &mut manifest)
                             match dep_result:
                                 ok none => none
-                                err err_ => ret err err_
+                                err failure => ret err failure
                 none => cont
         ret ok manifest
 
@@ -93,7 +93,7 @@ impl ManifestLoader:
         pair_result := split_key_value(line)
         pair := match pair_result:
             ok kv => kv
-            err err_ => ret err err_
+            err failure => ret err failure
         key := String::trim(&pair.key)
         value := normalize_value(pair.value)
 
@@ -113,7 +113,7 @@ impl ManifestLoader:
         pair_result := split_key_value(line)
         pair := match pair_result:
             ok kv => kv
-            err err_ => ret err err_
+            err failure => ret err failure
         name := String::trim(&pair.key)
         requirement_raw := String::trim(&pair.value)
         requirement := normalize_value(requirement_raw)
